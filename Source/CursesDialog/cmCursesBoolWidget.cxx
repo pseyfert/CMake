@@ -27,7 +27,7 @@ bool cmCursesBoolWidget::HandleInput(int& key, cmCursesMainForm*, WINDOW* w)
 {
 
   // 10 == enter
-  if (key == 10 || key == KEY_ENTER)
+  if (key == 10 || key == KEY_ENTER || key == ' ')
     {
     if (this->GetValueAsBool())
       {

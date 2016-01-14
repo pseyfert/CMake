@@ -70,7 +70,7 @@ bool cmCursesStringWidget::HandleInput(int& key, cmCursesMainForm* fm,
 
   FORM* form = fm->GetForm();
   // 10 == enter
-  if (!this->InEdit && ( key != 10 && key != KEY_ENTER ) )
+  if (!this->InEdit && ( key != 10 && key != KEY_ENTER && key != 'i') )
     {
     return false;
     }
@@ -106,12 +106,12 @@ bool cmCursesStringWidget::HandleInput(int& key, cmCursesMainForm* fm,
       }
 
     // If resize occured during edit, move out of edit mode
-    if (!this->InEdit && ( key != 10 && key != KEY_ENTER ) )
+    if (!this->InEdit && ( key != 10 && key != KEY_ENTER && key != 'i') )
       {
       return false;
       }
     // 10 == enter
-    if (key == 10 || key == KEY_ENTER)
+    if (key == 10 || key == KEY_ENTER || key == 'i')
       {
       this->OnReturn(fm, w);
       }
