@@ -979,7 +979,7 @@ void cmCursesMainForm::HandleInput()
       // therefore, the label field for the prev. entry is index-5
       // and the label field for the next entry is index+1
       // (index always corresponds to the value field)
-      else if ( key == KEY_DOWN || key == ctrl('n') )
+      else if ( key == KEY_DOWN || key == ctrl('n') || key == 'j' )
         {
         FIELD* cur = current_field(this->Form);
         size_t findex = field_index(cur);
@@ -1001,7 +1001,7 @@ void cmCursesMainForm::HandleInput()
       // therefore, the label field for the prev. entry is index-5
       // and the label field for the next entry is index+1
       // (index always corresponds to the value field)
-      else if ( key == KEY_UP || key == ctrl('p') )
+      else if ( key == KEY_UP || key == ctrl('p') || key == 'k' )
         {
         FIELD* cur = current_field(this->Form);
         int findex = field_index(cur);
