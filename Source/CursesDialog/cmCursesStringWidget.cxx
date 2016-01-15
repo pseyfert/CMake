@@ -110,13 +110,18 @@ bool cmCursesStringWidget::HandleInput(int& key, cmCursesMainForm* fm,
       {
       return false;
       }
-    // 10 == enter
-    if (key == 10 || key == KEY_ENTER || key == 'i')
+    // enter edit
+    if (!this->InEdit && ( key == 10 || key == KEY_ENTER || key == 'i' ) )
       {
       this->OnReturn(fm, w);
       }
-    else if ( key == KEY_DOWN || key == ctrl('n') ||
-              key == KEY_UP || key == ctrl('p') ||
+    // leave edit
+    else if (this->InEdit && ( key == 10 || key == KEY_ENTER ) )
+      {
+      this->OnReturn(fm, w);
+      }
+    else if ( key == KEY_DOWN  || key == ctrl('n') ||
+              key == KEY_UP    || key == ctrl('p') ||
               key == KEY_NPAGE || key == ctrl('d') ||
               key == KEY_PPAGE || key == ctrl('u'))
       {
