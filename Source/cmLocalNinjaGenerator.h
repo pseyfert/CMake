@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "cmLocalCommonGenerator.h"
+#include "cmDepends.h"
 #include "cmNinjaTypes.h"
 #include "cmOutputConverter.h"
 
@@ -109,6 +110,28 @@ private:
     CustomCommandTargetMap;
   CustomCommandTargetMap CustomCommandTargets;
   std::vector<cmCustomCommand const*> CustomCommands;
+
+	void WriteTargetDependRules(cmGeneratorTarget* tgt);
+
+  void SetImplicitDepends();
+
+  // File pairs for implicit dependency scanning.  The key of the map
+  // is the depender and the value is the explicit dependee.
+  struct ImplicitDependFileMap
+    : public std::map<std::string, cmDepends::DependencyVector>
+  {
+  };
+  struct ImplicitDependLanguageMap
+    : public std::map<std::string, ImplicitDependFileMap>
+  {
+	};
+	struct ImplicitDependTargetMap
+    : public std::map<std::string, ImplicitDependLanguageMap>
+  {
+  };
+
+  ImplicitDependTargetMap ImplicitDepends;
+
 };
 
 #endif // ! cmLocalNinjaGenerator_h

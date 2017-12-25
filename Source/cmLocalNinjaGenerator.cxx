@@ -17,6 +17,7 @@
 #include "cmGlobalNinjaGenerator.h"
 #include "cmMakefile.h"
 #include "cmNinjaTargetGenerator.h"
+#include "cmStateDirectory.h"
 #include "cmRulePlaceholderExpander.h"
 #include "cmSourceFile.h"
 #include "cmState.h"
@@ -24,6 +25,57 @@
 #include "cmSystemTools.h"
 #include "cm_auto_ptr.hxx"
 #include "cmake.h"
+
+namespace {
+	// Helper predicate for removing absolute paths that don't point to the
+	// source or binary directory. It is used when CMAKE_DEPENDS_IN_PROJECT_ONLY
+	// is set ON, to only consider in-project dependencies during the build.
+	class NotInProjectDir
+	{
+		public:
+			// Constructor with the source and binary directory's path
+			NotInProjectDir(const std::string& sourceDir, const std::string& binaryDir)
+				: SourceDir(sourceDir)
+					, BinaryDir(binaryDir)
+		{
+		} 
+
+			// Operator evaluating the predicate
+			bool operator()(const std::string& path) const
+			{   
+				// Keep all relative paths:
+				if (!cmSystemTools::FileIsFullPath(path)) {
+					return false;
+				}
+				// If it's an absolute path, check if it starts with the source
+				// direcotory:
+				return (
+						!(IsInDirectory(SourceDir, path) || IsInDirectory(BinaryDir, path)));
+			}
+
+		private:
+			// Helper function used by the predicate
+			static bool IsInDirectory(const std::string& baseDir,
+					const std::string& testDir)
+			{
+				// First check if the test directory "starts with" the base directory:
+				if (testDir.find(baseDir) != 0) {
+					return false;
+				}
+				// If it does, then check that it's either the same string, or that the
+				// next character is a slash:
+				return ((testDir.size() == baseDir.size()) ||
+						(testDir[baseDir.size()] == '/'));
+			}
+
+			// The path to the source directory
+			std::string SourceDir;
+			// The path to the binary directory
+			std::string BinaryDir;
+	};
+}
+
+
 
 cmLocalNinjaGenerator::cmLocalNinjaGenerator(cmGlobalGenerator* gg,
                                              cmMakefile* mf)
@@ -443,13 +495,338 @@ void cmLocalNinjaGenerator::AddCustomCommandTarget(cmCustomCommand const* cc,
   ins.first->second.insert(target);
 }
 
+void cmLocalNinjaGenerator::WriteTargetDependRules(cmGeneratorTarget* tgt)
+{
+	// must write the targets depend info file
+	std::string dir = this->GetTargetDirectory(tgt);
+	std::string InfoFileNameFull = dir;
+	InfoFileNameFull += "/DependInfo.cmake";
+	{
+		std::string dir = this->GetCurrentBinaryDirectory();
+		dir += "/";
+		dir += InfoFileNameFull;
+		InfoFileNameFull = dir;
+	}
+	cmGeneratedFileStream* InfoFileStream =
+		new cmGeneratedFileStream(InfoFileNameFull.c_str());
+	InfoFileStream->SetCopyIfDifferent(true);
+	if (!*InfoFileStream) {
+		return;
+	}
+	// this->LocalGenerator->WriteDependLanguageInfo(*InfoFileStream,
+	//                                              this->GeneratorTarget);
+	std::ostream& cmakefileStream = *InfoFileStream;
+
+
+	ImplicitDependLanguageMap const& implicitLangs =
+		ImplicitDepends[tgt->GetName()];
+
+	// list the languages
+	cmakefileStream << "# The set of languages for which implicit "
+		"dependencies are needed:\n";
+	cmakefileStream << "set(CMAKE_DEPENDS_LANGUAGES\n";
+	for (ImplicitDependLanguageMap::const_iterator l = implicitLangs.begin();
+			l != implicitLangs.end(); ++l) {
+		cmakefileStream << "  \"" << l->first << "\"\n";
+	}
+	cmakefileStream << "  )\n";
+
+	// now list the files for each language
+	cmakefileStream
+		<< "# The set of files for implicit dependencies of each language:\n";
+	for (ImplicitDependLanguageMap::const_iterator l = implicitLangs.begin();
+			l != implicitLangs.end(); ++l) {
+		cmakefileStream << "set(CMAKE_DEPENDS_CHECK_" << l->first << "\n";
+		ImplicitDependFileMap const& implicitPairs = l->second;
+
+		// for each file pair
+		for (ImplicitDependFileMap::const_iterator pi = implicitPairs.begin();
+				pi != implicitPairs.end(); ++pi) {
+			for (cmDepends::DependencyVector::const_iterator di =
+					pi->second.begin();
+					di != pi->second.end(); ++di) {
+				cmakefileStream << "  \"" << *di << "\" ";
+				cmakefileStream << "\"" << pi->first << "\"\n";
+			}
+		}
+		cmakefileStream << "  )\n";
+
+		// Tell the dependency scanner what compiler is used.
+		std::string cidVar = "CMAKE_";
+		cidVar += l->first;
+		cidVar += "_COMPILER_ID";
+		const char* cid = this->Makefile->GetDefinition(cidVar);
+		if (cid && *cid) {
+			cmakefileStream << "set(CMAKE_" << l->first << "_COMPILER_ID \"" << cid
+				<< "\")\n";
+		}
+
+		// Build a list of preprocessor definitions for the target.
+		std::set<std::string> defines;
+		this->AddCompileDefinitions(defines, tgt, this->ConfigName, l->first);
+		if (!defines.empty()) {
+			/* clang-format off */
+			cmakefileStream
+				<< "\n"
+				<< "# Preprocessor definitions for this target.\n"
+				<< "set(CMAKE_TARGET_DEFINITIONS_" << l->first << "\n";
+			/* clang-format on */
+			for (std::set<std::string>::const_iterator di = defines.begin();
+					di != defines.end(); ++di) {
+				cmakefileStream << "  " << cmOutputConverter::EscapeForCMake(*di)
+					<< "\n";
+			}
+			cmakefileStream << "  )\n";
+		}
+
+		// Target-specific include directories:
+		cmakefileStream << "\n"
+			<< "# The include file search paths:\n";
+		cmakefileStream << "set(CMAKE_" << l->first << "_TARGET_INCLUDE_PATH\n";
+		std::vector<std::string> includes;
+
+		const std::string& config =
+			this->Makefile->GetSafeDefinition("CMAKE_BUILD_TYPE");
+		this->GetIncludeDirectories(includes, tgt, l->first, config);
+		std::string binaryDir = this->GetState()->GetBinaryDirectory();
+		if (this->Makefile->IsOn("CMAKE_DEPENDS_IN_PROJECT_ONLY")) {
+			const char* sourceDir = this->GetState()->GetSourceDirectory();
+			cmEraseIf(includes, ::NotInProjectDir(sourceDir, binaryDir));
+		}
+		for (std::vector<std::string>::iterator i = includes.begin();
+				i != includes.end(); ++i) {
+			cmakefileStream << "  \"";
+			if (!cmOutputConverter::ContainedInDirectory(
+						binaryDir, *i, this->GetStateSnapshot().GetDirectory())) {
+				cmakefileStream << *i;
+			}
+			cmakefileStream <<  cmOutputConverter::ForceToRelativePath(binaryDir, *i);
+			cmakefileStream << "\"\n";
+		}
+		cmakefileStream << "  )\n";
+	}
+
+	// Store include transform rule properties.  Write the directory
+	// rules first because they may be overridden by later target rules.
+	std::vector<std::string> transformRules;
+	if (const char* xform =
+			this->Makefile->GetProperty("IMPLICIT_DEPENDS_INCLUDE_TRANSFORM")) {
+		cmSystemTools::ExpandListArgument(xform, transformRules);
+	}
+	if (const char* xform =
+			tgt->GetProperty("IMPLICIT_DEPENDS_INCLUDE_TRANSFORM")) {
+		cmSystemTools::ExpandListArgument(xform, transformRules);
+	}
+	if (!transformRules.empty()) {
+		cmakefileStream << "set(CMAKE_INCLUDE_TRANSFORMS\n";
+		for (std::vector<std::string>::const_iterator tri =
+				transformRules.begin();
+				tri != transformRules.end(); ++tri) {
+			cmakefileStream << "  " << cmOutputConverter::EscapeForCMake(*tri)
+				<< "\n";
+		}
+		cmakefileStream << "  )\n";
+	}
+
+	// Store multiple output pairs in the depend info file.
+	//if (!this->MultipleOutputPairs.empty()) {
+	//  /* clang-format off */
+	//  *InfoFileStream
+	//    << "\n"       
+	//    << "# Pairs of files generated by the same build rule.\n"
+	//    << "set(CMAKE_MULTIPLE_OUTPUT_PAIRS\n";
+	//  /* clang-format on */
+	//  for (MultipleOutputPairsType::const_iterator pi =
+	//         this->MultipleOutputPairs.begin();
+	//       pi != this->MultipleOutputPairs.end(); ++pi) {
+	//    *InfoFileStream 
+	//      << "  " << cmOutputConverter::EscapeForCMake(pi->first) << " "
+	//      << cmOutputConverter::EscapeForCMake(pi->second) << "\n";
+	//  }
+	//  *InfoFileStream << "  )\n\n";
+	//} 
+	//
+	//// Store list of targets linked directly or transitively.
+	//{                                             
+	//	/* clang-format off */
+	//	*InfoFileStream
+	//		<< "\n"
+	//		<< "# Targets to which this target links.\n"
+	//		<< "set(CMAKE_TARGET_LINKED_INFO_FILES\n";
+	//	/* clang-format on */                       
+	//	std::vector<std::string> dirs = this->GetLinkedTargetDirectories();
+	//	for (std::vector<std::string>::iterator i = dirs.begin(); i != dirs.end();
+	//			++i) {
+	//		*InfoFileStream << "  \"" << *i << "/DependInfo.cmake\"\n";
+	//	}      
+	//	*InfoFileStream << "  )\n";
+	//}   
+	//    std::string const& working_dir =
+	//      this->LocalGenerator->GetCurrentBinaryDirectory();
+	//      
+	//    /* clang-format off */
+	//    *this->InfoFileStream
+	//      << "\n"
+	//      << "# Fortran module output directory.\n"
+	//      << "set(CMAKE_Fortran_TARGET_MODULE_DIR \""
+	//      << this->GeneratorTarget->GetFortranModuleDirectory(working_dir)
+	//      << "\")\n";
+	//    /* clang-format on */
+	//  
+	//    // and now write the rule to use it
+	//    std::vector<std::string> depends;
+	//    std::vector<std::string> commands;
+	//  
+	//    // Construct the name of the dependency generation target.
+	//    std::string depTarget =
+	//      this->LocalGenerator->GetRelativeTargetDirectory(this->GeneratorTarget);
+	//    depTarget += "/depend";
+	//  
+	//    // Add a command to call CMake to scan dependencies.  CMake will
+	//    // touch the corresponding depends file after scanning dependencies.
+	//    std::ostringstream depCmd;
+	//  // TODO: Account for source file properties and directory-level
+	//  // definitions when scanning for dependencies.
+	//  #if !defined(_WIN32) || defined(__CYGWIN__)
+	//    // This platform supports symlinks, so cmSystemTools will translate
+	//    // paths.  Make sure PWD is set to the original name of the home
+	//    // output directory to help cmSystemTools to create the same
+	//    // translation table for the dependency scanning process.
+	//    depCmd << "cd " << (this->LocalGenerator->ConvertToOutputFormat(
+	//                         cmSystemTools::CollapseFullPath(
+	//                           this->LocalGenerator->GetBinaryDirectory()),
+	//                         cmOutputConverter::SHELL))
+	//           << " && ";
+	//  #endif
+	//    // Generate a call this signature:
+	//    //
+	//    //   cmake -E cmake_depends <generator>
+	//    //                          <home-src-dir> <start-src-dir>
+	//    //                          <home-out-dir> <start-out-dir>
+	//    //                          <dep-info> --color=$(COLOR)
+	//    //
+	//    // This gives the dependency scanner enough information to recreate
+	//    // the state of our local generator sufficiently for its needs.
+	//    depCmd << "$(CMAKE_COMMAND) -E cmake_depends \""
+	//           << this->GlobalGenerator->GetName() << "\" "
+	//           << this->LocalGenerator->ConvertToOutputFormat(
+	//                cmSystemTools::CollapseFullPath(
+	//                  this->LocalGenerator->GetSourceDirectory()),
+	//                cmOutputConverter::SHELL)
+	//           << " "
+	//           << this->LocalGenerator->ConvertToOutputFormat(
+	//                cmSystemTools::CollapseFullPath(
+	//                  this->LocalGenerator->GetCurrentSourceDirectory()),
+	//                cmOutputConverter::SHELL)
+	//           << " "
+	//           << this->LocalGenerator->ConvertToOutputFormat(
+	//                cmSystemTools::CollapseFullPath(
+	//                  this->LocalGenerator->GetBinaryDirectory()),
+	//                cmOutputConverter::SHELL)
+	//           << " "
+	//           << this->LocalGenerator->ConvertToOutputFormat(
+	//                cmSystemTools::CollapseFullPath(
+	//                  this->LocalGenerator->GetCurrentBinaryDirectory()),
+	//                cmOutputConverter::SHELL)
+	//           << " "
+	//           << this->LocalGenerator->ConvertToOutputFormat(
+	//                cmSystemTools::CollapseFullPath(this->InfoFileNameFull),
+	//                cmOutputConverter::SHELL);
+	//    if (this->LocalGenerator->GetColorMakefile()) {
+	//      depCmd << " --color=$(COLOR)";
+	//    }
+	//    commands.push_back(depCmd.str());
+	//  
+	//    // Make sure all custom command outputs in this target are built.
+	//    if (this->CustomCommandDriver == OnDepends) {
+	//      this->DriveCustomCommands(depends);
+	//    }
+	//  
+	//    // Write the rule.
+	//    this->LocalGenerator->WriteMakeRule(*this->BuildFileStream, CM_NULLPTR,
+	//                                        depTarget, depends, commands, true);
+	//
+
+	delete InfoFileStream;
+
+}
+
+void cmLocalNinjaGenerator::SetImplicitDepends() {
+  ImplicitDepends.clear();
+  for (std::vector<cmCustomCommand const*>::iterator vi =
+         this->CustomCommands.begin();
+				 vi != this->CustomCommands.end(); ++vi) {
+
+		CustomCommandTargetMap::iterator i = this->CustomCommandTargets.find(*vi);
+    std::set<cmGeneratorTarget*>::iterator j = i->second.begin();
+		for (cmCustomCommand::ImplicitDependsList::const_iterator idi =
+				(*vi)->GetImplicitDepends().begin();
+				idi != (*vi)->GetImplicitDepends().end(); ++idi) {
+			std::string objFullPath = cmSystemTools::CollapseFullPath((*vi)->GetOutputs()[0]);
+			std::string srcFullPath = cmSystemTools::CollapseFullPath(idi->second);
+
+			for (; j != i->second.end(); ++j) {
+				ImplicitDepends[(*j)->GetName()][idi->first][objFullPath.c_str()].push_back(srcFullPath.c_str());
+			}
+
+		}
+
+  }
+}
+
+
 void cmLocalNinjaGenerator::WriteCustomCommandBuildStatements()
 {
+  this->SetImplicitDepends();
+  cmSystemTools::Message("WriteCustomCommandBuildStatements");
   for (std::vector<cmCustomCommand const*>::iterator vi =
          this->CustomCommands.begin();
        vi != this->CustomCommands.end(); ++vi) {
-    CustomCommandTargetMap::iterator i = this->CustomCommandTargets.find(*vi);
-    assert(i != this->CustomCommandTargets.end());
+		char pseyfert[80];
+		CustomCommandTargetMap::iterator i = this->CustomCommandTargets.find(*vi);
+		if (true) { // study stuff
+			snprintf(pseyfert,79,"got custom command %s", (*vi)->GetComment());
+			cmSystemTools::Message(pseyfert);
+			snprintf(pseyfert,79,
+					"                                                                            ");
+			cmCustomCommand::ImplicitDependsList implicitlist = (*vi)->GetImplicitDepends();
+			for (size_t ppp = 0 ; ppp < (*vi)->GetOutputs().size() ; ++ppp) {
+				snprintf(pseyfert,79,"pseyfert for output %s", (*vi)->GetOutputs()[ppp].c_str());
+				cmSystemTools::Message(pseyfert);
+				snprintf(pseyfert,79,
+						"                                                                            ");
+			}
+			const cmCustomCommandLines commandlines = (*vi)->GetCommandLines();
+			for (auto line: commandlines) {
+				std::string addtome("");
+				for (auto word: line){
+					addtome += word;
+					addtome += " ";
+				}
+				snprintf(pseyfert,79,"%s",addtome.c_str());
+				cmSystemTools::Message(pseyfert);
+				snprintf(pseyfert,79,
+						"                                                                            ");
+			}
+			if (i == this->CustomCommandTargets.end()) {
+				snprintf(pseyfert,79,"no target map iterator");
+				cmSystemTools::Message(pseyfert);
+				snprintf(pseyfert,79,
+						"                                                                            ");
+			}
+		}
+		assert(i != this->CustomCommandTargets.end());
+
+//    if (commandlines.empty()) {
+//      snprintf(pseyfert,79,"command lines are empty");
+//      cmSystemTools::Message(pseyfert);
+//      snprintf(pseyfert,79,
+//"                                                                            ");
+//    }
+//    snprintf(pseyfert,79,"pseyfert got a list of implicit depends of length %d", implicitlist.size());
+//    cmSystemTools::Message(pseyfert);
+//      snprintf(pseyfert,79,
+//"                                                                            ");
 
     // A custom command may appear on multiple targets.  However, some build
     // systems exist where the target dependencies on some of the targets are
@@ -466,9 +843,21 @@ void cmLocalNinjaGenerator::WriteCustomCommandBuildStatements()
     this->GetGlobalNinjaGenerator()->AppendTargetDependsClosure(*j,
                                                                 ccTargetDeps);
     std::sort(ccTargetDeps.begin(), ccTargetDeps.end());
+
+
+		snprintf(pseyfert,79,"got target %s", (*j)->GetName());
+		cmSystemTools::Message(pseyfert);
+		snprintf(pseyfert,79,
+				"                                                                            ");
+		this->WriteTargetDependRules(*j);
+
     ++j;
 
     for (; j != i->second.end(); ++j) {
+			snprintf(pseyfert,79,"got target %s", (*j)->GetName());
+			cmSystemTools::Message(pseyfert);
+			snprintf(pseyfert,79,
+					"                                                                            ");
       std::vector<std::string> jDeps, depsIntersection;
       this->GetGlobalNinjaGenerator()->AppendTargetDependsClosure(*j, jDeps);
       std::sort(jDeps.begin(), jDeps.end());
@@ -476,6 +865,7 @@ void cmLocalNinjaGenerator::WriteCustomCommandBuildStatements()
                             jDeps.begin(), jDeps.end(),
                             std::back_inserter(depsIntersection));
       ccTargetDeps = depsIntersection;
+      this->WriteTargetDependRules(*j);
     }
 
     this->WriteCustomCommandBuildStatement(i->first, ccTargetDeps);
